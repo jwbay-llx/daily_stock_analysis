@@ -38,6 +38,13 @@ class TelegramSender:
         """检查 Telegram 配置是否完整"""
         return bool(self._telegram_config['bot_token'] and self._telegram_config['chat_id'])
 
+    @staticmethod
+    def _split_chat_ids(chat_id):
+        """按逗号拆分多个 Telegram 目标；不含逗号时返回单个目标组成的列表。"""
+        if not chat_id:
+            return []
+        return [part.strip() for part in str(chat_id).split(",") if part.strip()]
+
     def send_to_telegram(
         self,
         content: str,
@@ -75,7 +82,6 @@ class TelegramSender:
             return False
 
         bot_token = self._telegram_config['bot_token']
-        chat_id = target_chat_id
         message_thread_id = target_message_thread_id
 
         try:
@@ -92,25 +98,32 @@ class TelegramSender:
 
             telegram_content = self._convert_to_telegram_markdown(sanitized_content)
 
-            if utf16_len(telegram_content) <= max_length:
-                # 单条消息发送
-                return self._send_telegram_message(
-                    api_url,
-                    chat_id,
-                    sanitized_content,
-                    message_thread_id,
-                    timeout_seconds=timeout_seconds,
-                )
-            else:
-                # 按 Markdown 转义后的最终 payload 分段，避免转义字符使请求超限
-                return self._send_telegram_chunked(
-                    api_url,
-                    chat_id,
-                    telegram_content,
-                    max_length,
-                    message_thread_id,
-                    timeout_seconds=timeout_seconds,
-                )
+            results = []
+            for single_chat_id in self._split_chat_ids(target_chat_id):
+                if utf16_len(telegram_content) <= max_length:
+                    # 单条消息发送
+                    results.append(
+                        self._send_telegram_message(
+                            api_url,
+                            single_chat_id,
+                            sanitized_content,
+                            message_thread_id,
+                            timeout_seconds=timeout_seconds,
+                        )
+                    )
+                else:
+                    # 按 Markdown 转义后的最终 payload 分段，避免转义字符使请求超限
+                    results.append(
+                        self._send_telegram_chunked(
+                            api_url,
+                            single_chat_id,
+                            telegram_content,
+                            max_length,
+                            message_thread_id,
+                            timeout_seconds=timeout_seconds,
+                        )
+                    )
+            return bool(results) and all(results)
 
         except Exception as e:
             logger.error(f"发送 Telegram 消息失败: {e}")
@@ -322,7 +335,7 @@ class TelegramSender:
 
         for section in sections:
             if utf16_len(section) > max_length:
-                # 单段超限时强制切片，避免依赖“\\n---\\n”边界导致的整段超长发送
+                # 单段超限时强制切片，避免依赖“\n---\n”边界导致的整段超长发送
                 if not _flush_chunk():
                     return False
                 for long_chunk in _split_long_section(section, max_length):
@@ -363,23 +376,26 @@ class TelegramSender:
         if not self._is_telegram_configured():
             return False
         bot_token = self._telegram_config['bot_token']
-        chat_id = self._telegram_config['chat_id']
+        chat_ids = self._split_chat_ids(self._telegram_config['chat_id'])
         message_thread_id = self._telegram_config.get('message_thread_id')
         api_url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
-        try:
-            data = {"chat_id": chat_id}
-            if message_thread_id:
-                data['message_thread_id'] = message_thread_id
-            files = {"photo": ("report.png", image_bytes, "image/png")}
-            response = requests.post(api_url, data=data, files=files, timeout=30)
-            if response.status_code == 200 and response.json().get('ok'):
-                logger.info("Telegram 图片发送成功")
-                return True
-            logger.error("Telegram 图片发送失败: %s", response.text[:200])
-            return False
-        except Exception as e:
-            logger.error("Telegram 图片发送异常: %s", e)
-            return False
+        all_success = True
+        for chat_id in chat_ids:
+            try:
+                data = {"chat_id": chat_id}
+                if message_thread_id:
+                    data['message_thread_id'] = message_thread_id
+                files = {"photo": ("report.png", image_bytes, "image/png")}
+                response = requests.post(api_url, data=data, files=files, timeout=30)
+                if response.status_code == 200 and response.json().get('ok'):
+                    logger.info("Telegram 图片发送成功")
+                else:
+                    logger.error("Telegram 图片发送失败: %s", response.text[:200])
+                    all_success = False
+            except Exception as e:
+                logger.error("Telegram 图片发送异常: %s", e)
+                all_success = False
+        return all_success
 
     def _convert_to_telegram_markdown(self, text: str) -> str:
         """
