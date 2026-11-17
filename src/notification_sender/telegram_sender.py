@@ -478,7 +478,41 @@ class TelegramSender:
             return False
 
         sections = [s.strip() for s in content.split("\n---\n") if s.strip()]
-        if len(sections) < 2:
+
+        # 结尾的页脚（报告生成时间/分析模型）或过短碎片并入上一板块，不单独成条
+        while len(sections) >= 2:
+            last = sections[-1]
+            first_line = last.split("\n", 1)[0].strip().strip("*").strip()
+            if first_line.startswith("报告生成时间") or len(last) < 60:
+                sections[-2] = sections[-2] + "\n\n" + last
+                sections.pop()
+            else:
+                break
+
+        # 去重：标题与开头都相同的板块只保留第一份
+        seen = set()
+        unique_sections = []
+        for s in sections:
+            key = (self._section_title(s), s[:100])
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_sections.append(s)
+        sections = unique_sections
+
+        if len(sections) == 1:
+            # 单板块长内容（如大盘复盘）：先试按二级标题再拆；拆不开就整篇作为一个板块
+            only = sections[0]
+            if utf16_len(self._convert_to_telegram_markdown(only)) <= 1000:
+                return False
+            parts = [p.strip() for p in re.split(r"\n(?=## )", only) if p.strip()]
+            if len(parts) >= 2:
+                if len(parts[0]) < 200:
+                    parts[1] = parts[0] + "\n\n" + parts[1]
+                    parts.pop(0)
+                sections = parts
+
+        if not sections:
             return False
 
         max_length = 4096
