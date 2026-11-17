@@ -98,6 +98,17 @@ class TelegramSender:
 
             telegram_content = self._convert_to_telegram_markdown(sanitized_content)
 
+            # 板块链接模式：报告按板块逐条发到频道，推送只发带链接的目录。
+            # 任一步失败都返回 False，自动回退到下面的全文发送，保证报告不丢。
+            if self._send_section_index(
+                api_url,
+                self._split_chat_ids(target_chat_id),
+                sanitized_content,
+                message_thread_id,
+                timeout_seconds=timeout_seconds,
+            ):
+                return True
+
             results = []
             for single_chat_id in self._split_chat_ids(target_chat_id):
                 if utf16_len(telegram_content) <= max_length:
@@ -370,6 +381,160 @@ class TelegramSender:
             return False
 
         return all_success
+
+    # ===== 板块链接模式（推送只推目录，点链接看全文） =====
+
+    @staticmethod
+    def _section_title(section: str) -> str:
+        """取板块第一行非空文本作为标题，清掉会破坏 Markdown 链接的字符。"""
+        for line in section.splitlines():
+            title = line.strip().lstrip("#").lstrip(">").strip()
+            if not title:
+                continue
+            title = re.sub(r"[*_`\[\]()]", "", title)
+            title = re.sub(r"\s+", " ", title).strip()
+            if title:
+                return title[:30]
+        return "板块"
+
+    def _post_message_get_id(
+        self,
+        api_url: str,
+        chat_id: str,
+        text: str,
+        message_thread_id: Optional[str] = None,
+        *,
+        timeout_seconds: Optional[float] = None,
+        markdown_converted: bool = False,
+    ) -> Optional[int]:
+        """发送一条消息并返回 message_id；失败返回 None。逻辑与 _send_telegram_message 一致。"""
+        telegram_text = text if markdown_converted else self._convert_to_telegram_markdown(text)
+
+        payload = {
+            "chat_id": chat_id,
+            "text": telegram_text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+        }
+        if message_thread_id:
+            payload["message_thread_id"] = message_thread_id
+
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = requests.post(api_url, json=payload, timeout=timeout_seconds or 10)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                logger.error(f"Telegram 请求失败（取 message_id）: {e}")
+                return None
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("ok"):
+                    return result.get("result", {}).get("message_id")
+                error_desc = result.get("description", "未知错误")
+                logger.error(f"Telegram 返回错误: {error_desc}")
+                if self._should_fallback_to_plain_text(error_desc=error_desc):
+                    plain_payload = dict(payload)
+                    plain_payload.pop("parse_mode", None)
+                    plain_payload["text"] = text
+                    try:
+                        resp2 = requests.post(api_url, json=plain_payload, timeout=timeout_seconds or 10)
+                        if resp2.status_code == 200 and resp2.json().get("ok"):
+                            return resp2.json().get("result", {}).get("message_id")
+                    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                        pass
+                return None
+            elif response.status_code == 429 and attempt < max_retries:
+                time.sleep(self._get_telegram_retry_after_seconds(response, attempt))
+                continue
+            elif response.status_code >= 500 and attempt < max_retries:
+                time.sleep(2 ** attempt)
+                continue
+            else:
+                logger.error(f"Telegram 请求失败: HTTP {response.status_code}")
+                return None
+        return None
+
+    def _send_section_index(
+        self,
+        api_url: str,
+        chat_ids: list,
+        content: str,
+        message_thread_id: Optional[str] = None,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> bool:
+        """
+        板块链接模式：
+        1. 把报告按 "\\n---\\n" 拆成板块，逐条发到频道（-100 开头的目标），记下每条 message_id；
+        2. 生成一条只有板块链接的目录消息，发给全部目标（私聊 + 频道）。
+        任何一步失败返回 False，由调用方回退到全文发送。
+        """
+        channel_id = next((c for c in chat_ids if str(c).startswith("-100")), None)
+        if not channel_id:
+            return False
+
+        sections = [s.strip() for s in content.split("\n---\n") if s.strip()]
+        if len(sections) < 2:
+            return False
+
+        max_length = 4096
+        entries = []  # (title, link)
+        for section in sections:
+            title = self._section_title(section)
+            converted = self._convert_to_telegram_markdown(section)
+            # 超长板块按上限切片连续发送，链接指向第一条
+            pieces = []
+            rest = converted
+            while utf16_len(rest) > max_length:
+                cut = max(1, _custom_unit_to_index(rest, max_length, utf16_len))
+                pieces.append(rest[:cut])
+                rest = rest[cut:]
+            pieces.append(rest)
+
+            first_id = None
+            for piece in pieces:
+                mid = self._post_message_get_id(
+                    api_url,
+                    channel_id,
+                    piece,
+                    message_thread_id,
+                    timeout_seconds=timeout_seconds,
+                    markdown_converted=True,
+                )
+                if mid is None:
+                    logger.error("板块链接模式：板块发送失败，回退全文发送")
+                    return False
+                if first_id is None:
+                    first_id = mid
+            link = f"https://t.me/c/{str(channel_id)[4:]}/{first_id}"
+            entries.append((title, link))
+
+        date_match = re.search(r"\d{4}年\d{1,2}月\d{1,2}日|\d{4}-\d{2}-\d{2}", content)
+        header = "📊 *每日股票分析报告*"
+        if date_match:
+            header += f"（{date_match.group(0)}）"
+        lines = [header, "点下面的板块，直接跳到那一段全文：", ""]
+        for i, (title, link) in enumerate(entries, 1):
+            lines.append(f"{i}. [{title}]({link})")
+        index_text = "\n".join(lines)
+
+        for single_chat_id in chat_ids:
+            if not self._send_telegram_message(
+                api_url,
+                single_chat_id,
+                index_text,
+                message_thread_id,
+                timeout_seconds=timeout_seconds,
+            ):
+                logger.error("板块链接模式：目录发送失败，回退全文发送")
+                return False
+
+        logger.info(f"板块链接模式发送成功：{len(entries)} 个板块")
+        return True
 
     def _send_telegram_photo(self, image_bytes: bytes) -> bool:
         """Send image via Telegram sendPhoto API (Issue #289)."""
